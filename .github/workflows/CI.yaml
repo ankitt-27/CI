@@ -1,228 +1,153 @@
-name: CI Workflow
+name: DevSecOps Pipeline
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
 
-# ---------------- CACHE JOB ----------------
-  Cache:
-    name: Cache Dependencies
+  test:
     runs-on: ubuntu-latest
 
-    outputs:
-      cache-key: ${{ steps.cache.outputs.cache-primary-key }}
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Set Up Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: 22
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
 
-      - name: Cache Node Modules
-        id: cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            node_modules
-            yarn.lock
-            .yarn
-          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+    - name: Install dependencies
+      run: npm install
 
-# ---------------- TEST JOB ----------------
-  Test:
-    name: Run Tests
+    - name: Install Chrome
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y chromium-browser
+
+    - name: Run Angular tests
+      run: |
+        npm install -g @angular/cli
+        ng test --watch=false --browsers=ChromeHeadless
+
+  gitleaks:
     runs-on: ubuntu-latest
-    needs: Cache
+    needs: test
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Set Up Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: 22
+    - name: Run Gitleaks
+      run: |
+        docker run --rm \
+        -v ${{ github.workspace }}:/repo \
+        zricethezav/gitleaks:latest detect \
+        --source=/repo \
+        --report-format=json \
+        --report-path=/repo/gitleaks.json
 
-      - name: Restore Cache
-        uses: actions/cache@v3
-        with:
-          path: |
-            node_modules
-            yarn.lock
-            .yarn
-          key: ${{ needs.Cache.outputs.cache-key }}
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      with:
+        name: gitleaks-report
+        path: gitleaks.json
 
-      - name: Install Dependencies
-        run: yarn install
-
-      - name: Install Angular CLI
-        run: yarn global add @angular/cli
-
-      - name: Run Tests
-        run: |
-          cd frontend
-          ng test --watch=false --source-map=true
-          cd ..
-          npm run test:server
-
-# ---------------- GITLEAKS ----------------
-  GitLeaks:
-    name: Run GitLeaks
+  semgrep:
     runs-on: ubuntu-latest
-    needs: Cache
+    needs: test
 
     steps:
-      - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
-      - name: Run Gitleaks
-        run: |
-          docker run --rm -v ${{ github.workspace }}:/repo \
-          zricethezav/gitleaks:latest detect \
-          --source /repo \
-          --report-format json \
-          --report-path gitleaks.json
+    - name: Run Semgrep
+      run: |
+        docker run --rm \
+        -v "${PWD}:/src" \
+        returntocorp/semgrep \
+        semgrep scan --config auto --json --output semgrep.json
 
-      - name: Upload Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: Gitleaks-report
-          path: gitleaks.json
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      with:
+        name: semgrep-report
+        path: semgrep.json
 
-# ---------------- NODEJSSCAN ----------------
-  Nodejsscan:
-    name: Run Nodejsscan
+  nodejsscan:
     runs-on: ubuntu-latest
-    needs: Cache
+    needs: test
 
     steps:
-      - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
-      - name: Run Nodejsscan
-        uses: ajinabraham/njsscan-action@master
-        with:
-          args: '. --sarif --output nodejsscan.sarif'
+    - name: Run NodeJsScan
+      run: |
+        docker run --rm \
+        -v ${{ github.workspace }}:/app \
+        opensecurity/nodejsscan \
+        nodejsscan -d /app -o /app/nodejsscan.json
 
-      - name: Upload Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: Nodejsscan-report
-          path: nodejsscan.sarif
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      with:
+        name: nodejsscan-report
+        path: nodejsscan.json
 
-# ---------------- SEMGREP ----------------
-  Semgrep:
-    name: Run Semgrep
+  retirejs:
     runs-on: ubuntu-latest
-    needs: Cache
-    container:
-      image: semgrep/semgrep
+    needs: test
 
     steps:
-      - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
-      - name: Run Semgrep
-        run: semgrep scan --config auto --json-output semgrep.json
+    - name: Install RetireJS
+      run: npm install -g retire
 
-      - name: Upload Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: Semgrep-report
-          path: semgrep.json
+    - name: Run RetireJS
+      run: retire --outputformat json --outputpath retirejs.json
 
-# ---------------- RETIREJS ----------------
-  Retirejsscan:
-    name: Run RetireJS
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      with:
+        name: retirejs-report
+        path: retirejs.json
+
+  docker-trivy:
     runs-on: ubuntu-latest
-    needs: Cache
+    needs: [gitleaks, semgrep, nodejsscan, retirejs]
 
     steps:
-      - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 22
+    - name: Convert username to lowercase
+      run: echo "DOCKER_USER=$(echo ${{ secrets.DOCKERHUB_USERNAME }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
-      - name: Install RetireJS
-        run: |
-          yarn install
-          npm install -g retire
+    - name: Login to DockerHub
+      run: |
+        echo "${{ secrets.DOCKERHUB_PASSWORD }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
-      - name: Run RetireJS
-        run: retire --path . --outputformat json --outputpath retirejsscan.json || true
+    - name: Build Docker Image
+      run: |
+        docker build -t docker.io/$DOCKER_USER/owasp-juiceapp:${{ github.sha }} .
 
-      - name: Upload Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: Retirejsscan-report
-          path: retirejsscan.json
+    - name: Push Docker Image
+      run: |
+        docker push docker.io/$DOCKER_USER/owasp-juiceapp:${{ github.sha }}
 
-# ---------------- TRIVY + DOCKER ----------------
-  Trivy:
-    name: Build and Scan Docker Image
-    runs-on: ubuntu-latest
-    needs: [GitLeaks, Nodejsscan, Semgrep, Retirejsscan]
+    - name: Run Trivy scan
+      run: |
+        docker run --rm \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        aquasec/trivy image \
+        --format json \
+        --output trivy.json \
+        docker.io/$DOCKER_USER/owasp-juiceapp:${{ github.sha }}
 
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Convert username to lowercase
-        run: echo "DOCKER_USER=$(echo ${{ secrets.DOCKERHUB_USERNAME }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
-
-      - name: Build Docker Image
-        run: |
-          docker build -t docker.io/$DOCKER_USER/owasp-juiceapp:${{ github.sha }} .
-
-      - name: Scan with Trivy
-        uses: aquasecurity/trivy-action@0.20.0
-        with:
-          image-ref: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/owasp-juiceapp:${{ github.sha }}
-          format: json
-          output: trivy.json
-
-      - name: Login DockerHub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
-
-      - name: Push Image
-        run: |
-          docker push docker.io/$DOCKER_USER/owasp-juiceapp:${{ github.sha }}
-
-      - name: Upload Trivy Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: Trivy-report
-          path: trivy.json
-
-# ---------------- FINAL REPORT ----------------
-  UploadReports:
-    name: Upload Reports
-    runs-on: ubuntu-latest
-    needs: Trivy
-
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Download Reports
-        uses: actions/download-artifact@v4
-        with:
-          path: reports
-
-      - name: Set Up Python
-        uses: actions/setup-python@v4
-
-      - name: Install Requests
-        run: pip install requests
-
-      - name: Run Upload Script
-        run: |
-          python3 upload-reports.py reports/gitleaks.json
-          python3 upload-reports.py reports/nodejsscan.sarif
-          python3 upload-reports.py reports/semgrep.json
-          python3 upload-reports.py reports/retirejsscan.json
-          python3 upload-reports.py reports/trivy.json
-          
+    - name: Upload report
+      uses: actions/upload-artifact@v4
+      with:
+        name: trivy-report
+        path: trivy.json
