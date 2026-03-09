@@ -225,3 +225,4 @@ jobs:
           python3 upload-reports.py reports/semgrep.json
           python3 upload-reports.py reports/retirejsscan.json
           python3 upload-reports.py reports/trivy.json
+          
